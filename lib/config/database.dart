@@ -1,11 +1,47 @@
 import 'package:janpath_school/models/class_fee.dart';
 import 'package:janpath_school/models/note.dart';
+import 'package:janpath_school/models/payment.dart';
 import 'package:janpath_school/models/school_class.dart';
 import 'package:janpath_school/models/section.dart';
 import 'package:janpath_school/models/student.dart';
 import 'package:janpath_school/models/student_bill.dart';
+import 'package:janpath_school/payments/widgets/student_search_field.dart';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
+
+class UnpaidBillInfo {
+  final StudentBill bill;
+  final double unpaidAmount;
+  final ClassFee? classFee;
+
+  UnpaidBillInfo({
+    required this.bill,
+    required this.unpaidAmount,
+    this.classFee,
+  });
+
+  static UnpaidBillInfo fromMap(Map<String, dynamic> map) {
+    return UnpaidBillInfo(
+      bill: StudentBill.fromMap(map),
+      unpaidAmount: map['unpaidAmount'],
+      classFee: map['classFee'] != null
+          ? ClassFee.fromMap(map['classFee'])
+          : null,
+    );
+  }
+}
+
+class PaymentDistribution {
+  final int billId;
+  final double amountToPay;
+  final double remainingDue;
+
+  PaymentDistribution({
+    required this.billId,
+    required this.amountToPay,
+    required this.remainingDue,
+  });
+}
 
 class DatabaseHelper {
   static final DatabaseHelper _instance = DatabaseHelper._internal();
@@ -25,13 +61,25 @@ class DatabaseHelper {
     final databasesPath = await getDatabasesPath();
     final path = join(databasesPath, 'school_management.db');
 
-    return await openDatabase(path, version: 1, onCreate: _createTables);
+    return await openDatabase(
+      path,
+      version: 2,
+      onCreate: _createTables,
+      onUpgrade: _onUpgrade,
+    );
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // Add any new columns or tables for version 2
+      await _createTables(db, newVersion);
+    }
   }
 
   Future<void> _createTables(Database db, int version) async {
     // Create Student table
     await db.execute('''
-      CREATE TABLE Student (
+      CREATE TABLE IF NOT EXISTS Student (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         email TEXT,
@@ -53,7 +101,7 @@ class DatabaseHelper {
 
     // Create Class table
     await db.execute('''
-      CREATE TABLE Class (
+      CREATE TABLE IF NOT EXISTS Class (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         createdAt TEXT NOT NULL,
@@ -63,7 +111,7 @@ class DatabaseHelper {
 
     // Create Section table
     await db.execute('''
-      CREATE TABLE Section (
+      CREATE TABLE IF NOT EXISTS Section (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         classId INTEGER NOT NULL,
@@ -76,7 +124,7 @@ class DatabaseHelper {
 
     // Create ClassFee table
     await db.execute('''
-      CREATE TABLE ClassFee (
+      CREATE TABLE IF NOT EXISTS ClassFee (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         classId INTEGER,
         sectionId INTEGER,
@@ -92,13 +140,13 @@ class DatabaseHelper {
 
     // Create StudentBill table
     await db.execute('''
-      CREATE TABLE StudentBill (
+      CREATE TABLE IF NOT EXISTS StudentBill (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         billNumber TEXT,
         studentId INTEGER NOT NULL,
         classFeeId INTEGER NOT NULL,
         billedAt TEXT NOT NULL,
-        amountPaid REAL NOT NULL,
+        amountPaid REAL NOT NULL DEFAULT 0.0,
         session TEXT NOT NULL,
         createdAt TEXT NOT NULL,
         updatedAt TEXT NOT NULL,
@@ -109,7 +157,7 @@ class DatabaseHelper {
 
     // Create ExtraBill table
     await db.execute('''
-      CREATE TABLE ExtraBill (
+      CREATE TABLE IF NOT EXISTS ExtraBill (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         billNumber TEXT,
         studentId INTEGER NOT NULL,
@@ -124,7 +172,7 @@ class DatabaseHelper {
 
     // Create Payment table
     await db.execute('''
-      CREATE TABLE Payment (
+      CREATE TABLE IF NOT EXISTS Payment (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         billNumber TEXT,
         date TEXT,
@@ -145,7 +193,7 @@ class DatabaseHelper {
 
     // Create PaymentItem table
     await db.execute('''
-      CREATE TABLE PaymentItem (
+      CREATE TABLE IF NOT EXISTS PaymentItem (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         paymentId INTEGER NOT NULL,
         sn INTEGER NOT NULL,
@@ -158,7 +206,7 @@ class DatabaseHelper {
 
     // Create Note table
     await db.execute('''
-      CREATE TABLE Note (
+      CREATE TABLE IF NOT EXISTS Note (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         content TEXT NOT NULL,
         createdAt TEXT NOT NULL,
@@ -334,6 +382,216 @@ class DatabaseHelper {
       maps = await db.query('StudentBill');
     }
     return List.generate(maps.length, (i) => StudentBill.fromMap(maps[i]));
+  }
+
+  Future<int> updateStudentBill(StudentBill studentBill) async {
+    final db = await database;
+    return await db.update(
+      'StudentBill',
+      studentBill.toMap(),
+      where: 'id = ?',
+      whereArgs: [studentBill.id],
+    );
+  }
+
+  // Get unpaid bills for a student
+  Future<List<UnpaidBillInfo>> getUnpaidBillsForStudent(int studentId) async {
+    final db = await database;
+    final query = '''
+      SELECT sb.*, cf.classFee, cf.session as feeSession
+      FROM StudentBill sb
+      JOIN ClassFee cf ON sb.classFeeId = cf.id
+      WHERE sb.studentId = ? AND sb.amountPaid < cf.classFee
+      ORDER BY sb.billedAt ASC
+    ''';
+
+    final maps = await db.rawQuery(query, [studentId]);
+
+    List<UnpaidBillInfo> unpaidBills = [];
+    for (var map in maps) {
+      final bill = StudentBill.fromMap(map);
+      final classFeeAmount = map['classFee'] as double;
+      final unpaidAmount = classFeeAmount - bill.amountPaid;
+
+      if (unpaidAmount > 0) {
+        unpaidBills.add(UnpaidBillInfo(bill: bill, unpaidAmount: unpaidAmount));
+      }
+    }
+
+    return unpaidBills;
+  }
+
+  // Payment operations
+  Future<Map<String, dynamic>> savePayment(
+    Map<String, dynamic> paymentData,
+  ) async {
+    final db = await database;
+
+    return await db.transaction<Map<String, dynamic>>((txn) async {
+      // Create the payment record
+      final payment = Payment(
+        billNumber: paymentData['billNumber'],
+        date: paymentData['date'] != null
+            ? DateTime.parse(paymentData['date'])
+            : null,
+        studentName: paymentData['studentName'],
+        classValue: paymentData['class'],
+        rollNumber: paymentData['rollNumber'],
+        guardianName: paymentData['guardianName'],
+        medium: paymentData['paymentMode'],
+        session: paymentData['session'],
+        parentName: paymentData['parentName'],
+        address: paymentData['address'],
+        totalAmount: paymentData['totalAmount'],
+        totalInWords: paymentData['totalInWords'],
+        accountantSignature: paymentData['accountantSignature'],
+        createdAt: DateTime.now(),
+      );
+
+      final paymentId = await txn.insert('Payment', payment.toMap());
+
+      // Insert payment items
+      if (paymentData['items'] != null) {
+        for (int i = 0; i < paymentData['items'].length; i++) {
+          final item = paymentData['items'][i];
+          final paymentItem = PaymentItem(
+            paymentId: paymentId,
+            sn: i + 1,
+            description: item['description'],
+            amount: item['amount'],
+            remarks: item['remarks'],
+          );
+          await txn.insert('PaymentItem', paymentItem.toMap());
+        }
+      }
+
+      // Update student bills if billIds are provided
+      List<Map<String, dynamic>> updatedBills = [];
+      if (paymentData['billIds'] != null && paymentData['billIds'].isNotEmpty) {
+        final billIds = List<int>.from(paymentData['billIds']);
+
+        // Get student bills with class fees
+        final billsQuery =
+            '''
+          SELECT sb.*, cf.classFee
+          FROM StudentBill sb
+          JOIN ClassFee cf ON sb.classFeeId = cf.id
+          WHERE sb.id IN (${billIds.map((e) => '?').join(',')})
+        ''';
+
+        final billMaps = await txn.rawQuery(billsQuery, billIds);
+
+        // Distribute payment across bills
+        final paymentDistribution = _distributeBillPayment(
+          billMaps,
+          paymentData['totalAmount'],
+        );
+
+        // Update each bill
+        for (final distribution in paymentDistribution) {
+          if (distribution.amountToPay > 0) {
+            await txn.rawUpdate(
+              '''
+              UPDATE StudentBill 
+              SET amountPaid = amountPaid + ?, updatedAt = ?
+              WHERE id = ?
+            ''',
+              [
+                distribution.amountToPay,
+                DateTime.now().toIso8601String(),
+                distribution.billId,
+              ],
+            );
+
+            updatedBills.add({
+              'billId': distribution.billId,
+              'paymentApplied': distribution.amountToPay,
+              'remainingDue': distribution.remainingDue,
+            });
+          }
+        }
+      }
+
+      return {
+        'success': true,
+        'paymentId': paymentId,
+        'payment': payment.copyWith(id: paymentId),
+        'updatedBills': updatedBills,
+        'message': 'भुक्तानी सफलतापूर्वक बुझाइयो!',
+      };
+    });
+  }
+
+  // Payment distribution logic (similar to your Prisma function)
+  List<PaymentDistribution> _distributeBillPayment(
+    List<Map<String, dynamic>> bills,
+    double totalPayment,
+  ) {
+    List<PaymentDistribution> distribution = [];
+    double remainingPayment = totalPayment;
+
+    // Sort bills by creation date (oldest first)
+    bills.sort((a, b) {
+      final dateA = DateTime.parse(a['billedAt']);
+      final dateB = DateTime.parse(b['billedAt']);
+      return dateA.compareTo(dateB);
+    });
+
+    for (final bill in bills) {
+      if (remainingPayment <= 0) break;
+
+      final classFee = bill['classFee'] as double;
+      final amountPaid = bill['amountPaid'] as double;
+      final dueAmount = classFee - amountPaid;
+
+      if (dueAmount > 0) {
+        final amountToPay = remainingPayment >= dueAmount
+            ? dueAmount
+            : remainingPayment;
+        final remainingDue = dueAmount - amountToPay;
+
+        distribution.add(
+          PaymentDistribution(
+            billId: bill['id'] as int,
+            amountToPay: amountToPay,
+            remainingDue: remainingDue,
+          ),
+        );
+
+        remainingPayment -= amountToPay;
+      }
+    }
+
+    return distribution;
+  }
+
+  // Get payment history
+  Future<List<Payment>> getPayments({int? limit}) async {
+    final db = await database;
+    final maps = await db.query(
+      'Payment',
+      orderBy: 'createdAt DESC',
+      limit: limit,
+    );
+    return List.generate(maps.length, (i) => Payment.fromMap(maps[i]));
+  }
+
+  Future<Payment?> getPayment(int id) async {
+    final db = await database;
+    final maps = await db.query('Payment', where: 'id = ?', whereArgs: [id]);
+    if (maps.isEmpty) return null;
+    return Payment.fromMap(maps.first);
+  }
+
+  Future<List<PaymentItem>> getPaymentItems(int paymentId) async {
+    final db = await database;
+    final maps = await db.query(
+      'PaymentItem',
+      where: 'paymentId = ?',
+      whereArgs: [paymentId],
+      orderBy: 'sn ASC',
+    );
+    return List.generate(maps.length, (i) => PaymentItem.fromMap(maps[i]));
   }
 
   // Close database
